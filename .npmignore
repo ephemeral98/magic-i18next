@@ -1,0 +1,6 @@
+# 若将来 package.json 的 files 被误改，避免把凭证与本地配置打进 tarball
+.env
+.env.*
+**/google-creds.json
+**/*-creds.json
+**/*.pem
