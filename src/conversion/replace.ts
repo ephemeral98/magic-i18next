@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { ConversionMap } from './types';
 import { isEmpty } from '../utils/commonTools';
 import { getConfig } from '../config/runtime';
@@ -19,6 +20,62 @@ export const regexFuc =
 
 // 匹配 $k`auto.17__auto.17__auto.17__auto.17__auto.17__auto.14__undefined` / $k`auto.17__auto.17__auto.17__auto.17__auto.17__auto.14__undefined`
 export const regexTx = /\$k\((['"'])(.*?)\1\)/g;
+
+/* === Key 生成策略 ====================================================
+ * 旧方案：'auto' 命名空间 + 自增数字 + 全表 O(n) 线性查重
+ *   - key 与扫描顺序耦合，不同机器/不同时序结果不一致
+ *   - 同一文案在不同文件需重新查重才能复用
+ * 新方案：md5(normalizedValue).slice(0, 8) 作为子键
+ *   - key 由内容唯一决定，扫描顺序无关、跨文件天然去重
+ *   - 查重退化成 O(1) 字典命中
+ *   - 极小概率前 8 位碰撞 → 按位延长 hash 直至唯一
+ *   - 兼容历史数字 key：扫描时优先复用既有 key，避免迁移期同文案双份入库
+ * ==================================================================== */
+
+const NAMESPACE = 'auto';
+const HASH_LEN = 8;
+// auto.123__文案（旧自增）/ auto.8f2a1b3c__文案（新 hash）都视为已转换，避免二次包裹
+const ALREADY_CONVERTED = /^auto\.[\w-]+__/;
+
+/** 进程级 text → subKey 缓存：同一文案多次出现时省掉重复 md5 计算 + 碰撞探测 */
+const hashCache = new Map<string, string>();
+
+/**
+ * 为 normalizedValue 取或新建一个稳定子键。
+ *
+ * @param text       归一化后的文案（${var} 已替换为 {0} / {{0}} 等占位）
+ * @param existing   命名空间下已有的 key→value（可能含历史数字 key）
+ * @param valueToKey 反查表 value→key；命中即复用，未命中则新建后写入
+ */
+function getOrCreateSubKey(
+  text: string,
+  existing: Record<string, string>,
+  valueToKey: Map<string, string>,
+): string {
+  // 1) 已存在同文案：直接复用 —— 兼容旧自增 key，杜绝同一文案在 JSON 里出现两份
+  const reused = valueToKey.get(text);
+  if (reused !== undefined) return reused;
+
+  // 2) 进程内缓存仍然有效（existing 里也确认存在该映射）
+  const cached = hashCache.get(text);
+  if (cached !== undefined && existing[cached] === text) return cached;
+
+  // 3) md5 前 8 位作为新 key；命中已占用且内容不同就按位延长 hash 直至唯一
+  const fullHash = crypto.createHash('md5').update(text).digest('hex');
+  let len = HASH_LEN;
+  let subKey = fullHash.slice(0, len);
+  while (existing[subKey] !== undefined && existing[subKey] !== text) {
+    len += 1;
+    if (len > fullHash.length) {
+      throw new Error(`hash 碰撞且无法在 md5 长度内消解: ${text}`);
+    }
+    subKey = fullHash.slice(0, len);
+  }
+
+  hashCache.set(text, subKey);
+  valueToKey.set(text, subKey);
+  return subKey;
+}
 
 /**
  * 获取需要替换的内容，统一输出标签模板风格
@@ -81,17 +138,21 @@ export async function replaceContent(
   conversionMap: ConversionMap,
   bakContent: ConversionMap,
 ): Promise<{ [key: string]: string }> {
-  let index = 1;
   const promises: Promise<string>[] = [];
-  const key = 'auto';
 
-  // 初始化转换映射
-  conversionMap[key] = isEmpty(conversionMap[key]) ? {} : conversionMap[key];
+  conversionMap[NAMESPACE] = isEmpty(conversionMap[NAMESPACE])
+    ? {}
+    : conversionMap[NAMESPACE];
 
-  // 合并备份文件内容
-  if (conversionMap[key] || bakContent[key]) {
-    conversionMap[key] = { ...bakContent[key], ...conversionMap[key] };
-    index = Object.keys(conversionMap[key]).length + 1;
+  // 历史词条作为防碰撞 / 复用基底（每个文件循环都会重新合并一次，幂等）
+  if (bakContent[NAMESPACE]) {
+    conversionMap[NAMESPACE] = { ...bakContent[NAMESPACE], ...conversionMap[NAMESPACE] };
+  }
+
+  // 反查表：value→key（首次出现优先），让历史数字 key 与新 hash key 都能 O(1) 复用
+  const valueToKey = new Map<string, string>();
+  for (const [k, v] of Object.entries(conversionMap[NAMESPACE])) {
+    if (!valueToKey.has(v)) valueToKey.set(v, k);
   }
 
   // 匹配并准备替换
@@ -123,8 +184,8 @@ export async function replaceContent(
 
     const value = p1 || p2 || p3 || p4;
 
-    // 已经是目标格式（如 auto.10__文案）则跳过，避免重复转换导致嵌套污染
-    if (regex === regexNew && /^auto\.\d+__/.test(value)) {
+    // 已经是目标格式（auto.<数字 | hash>__文案）则跳过，避免二次包裹
+    if (regex === regexNew && ALREADY_CONVERTED.test(value)) {
       promises.push(Promise.resolve(match));
       return match;
     }
@@ -165,26 +226,15 @@ export async function replaceContent(
       });
     }
 
-    // 去重 - 基于值而不是key
-    let foundIndex = index;
-    let isDuplicate = false;
-    
-    for (const [inx, val] of Object.entries(conversionMap[key])) {
-      if (val === normalizedValue) {
-        foundIndex = parseInt(inx);
-        isDuplicate = true;
-        break;
-      }
-    }
-    
-    if (!isDuplicate) {
-      conversionMap[key][index] = normalizedValue;
-      foundIndex = index;
-      index += 1; // 新增后递增，避免所有新文案复用同一个序号
-    }
+    // 用内容驱动的稳定 hash 替代“自增数字 + O(n) 线性查重”
+    // 同一 normalizedValue 永远得到同一 subKey；历史数字 key 通过 valueToKey 优先复用
+    const subKey = getOrCreateSubKey(normalizedValue, conversionMap[NAMESPACE], valueToKey);
+    conversionMap[NAMESPACE][subKey] = normalizedValue;
 
-    // 生成新的key格式: auto.自增数字__文案
-    const newKey = `${key}.${foundIndex}__${value}`;
+    // 仍保留 __${value} 后缀：
+    //   1. 与现有 $k 运行时兼容（运行时按分隔符切出真正 key）
+    //   2. 在源码中可视化对应文案，方便 review
+    const newKey = `${NAMESPACE}.${subKey}__${value}`;
 
     if (regex === regexNew) {
       // 统一替换为 $k`auto.17__auto.17__auto.10__...`（不带括号）
@@ -204,7 +254,7 @@ export async function replaceContent(
     fs.writeFileSync(fileDir, output, 'utf-8');
   }
 
-  return conversionMap[key];
+  return conversionMap[NAMESPACE];
 }
 
 /**
